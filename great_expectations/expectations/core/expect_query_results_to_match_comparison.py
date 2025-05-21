@@ -322,7 +322,20 @@ class ExpectQueryResultsToMatchComparison(BatchExpectation):
         missing_rows_table = cls._create_observed_values_table(missing_rows)
         unexpected_rows_table = cls._create_observed_values_table(unexpected_rows)
 
-        if len(missing_rows_cols) == 1 and len(unexpected_rows_cols) == 1:
+        if (
+            len(missing_rows) == 1
+            and len(unexpected_rows) == 1
+            and len(missing_rows_cols) == 1
+            and len(unexpected_rows_cols) == 1
+        ):
+            return cls._create_single_value(
+                comparison_col_name=missing_rows_cols[0],
+                base_col_name=unexpected_rows_cols[0],
+                configuration=configuration,
+                result=result,
+                runtime_configuration=runtime_configuration,
+            )
+        elif len(missing_rows_cols) == 1 and len(unexpected_rows_cols) == 1:
             return cls._create_observed_values_set(
                 configuration=configuration,
                 result=result,
@@ -341,6 +354,62 @@ class ExpectQueryResultsToMatchComparison(BatchExpectation):
                     label="Missing records",
                 ),
             ]
+
+    @classmethod
+    def _create_single_value(
+        cls,
+        comparison_col_name: str,
+        base_col_name: str,
+        configuration: Optional[ExpectationConfiguration] = None,
+        result: Optional[ExpectationValidationResult] = None,
+        runtime_configuration: Optional[dict] = None,
+    ) -> list[RenderedAtomicContent]:
+        result_details = cls._get_details_from_results(result)
+
+        renderer_configuration_base: RendererConfiguration = RendererConfiguration(
+            configuration=configuration,
+            result=result,
+            runtime_configuration=runtime_configuration,
+        )
+        base_value = result_details["unexpected_rows"][0][base_col_name]
+        renderer_configuration_base.add_param(
+            name="base_value",
+            value=base_value,
+        )
+        renderer_configuration_base.template_str = "Observed value: $base_value"
+
+        renderer_configuration_comparison: RendererConfiguration = RendererConfiguration(
+            configuration=configuration,
+            result=result,
+            runtime_configuration=runtime_configuration,
+        )
+        comparison_value = result_details["missing_rows"][0][comparison_col_name]
+        renderer_configuration_comparison.add_param(
+            name="comparison_value",
+            value=comparison_value,
+        )
+        renderer_configuration_comparison.template_str = "Expected value: $comparison_value"
+
+        return [
+            RenderedAtomicContent(
+                name=AtomicDiagnosticRendererType.OBSERVED_VALUE,
+                value=RenderedAtomicValue(
+                    template=renderer_configuration_base.template_str,
+                    params=renderer_configuration_base.params.dict(),
+                    schema={"type": "com.superconductive.rendered.string"},
+                ),
+                value_type="StringValueType",
+            ),
+            RenderedAtomicContent(
+                name=AtomicDiagnosticRendererType.OBSERVED_VALUE,
+                value=RenderedAtomicValue(
+                    template=renderer_configuration_comparison.template_str,
+                    params=renderer_configuration_comparison.params.dict(),
+                    schema={"type": "com.superconductive.rendered.string"},
+                ),
+                value_type="StringValueType",
+            ),
+        ]
 
     @classmethod
     def _create_observed_values_set(

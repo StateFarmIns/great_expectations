@@ -662,3 +662,51 @@ def test_rendering_with_one_column(multi_source_batch: MultiSourceBatch):
             ),
         )
     ]
+
+
+@multi_source_batch_setup(
+    multi_source_test_configs=SQLITE_ONLY,
+    comparison_data=pd.DataFrame({"foo": [1]}),
+    base_data=pd.DataFrame({"bar": [2]}),
+)
+def test_rendering_with_one_value(multi_source_batch: MultiSourceBatch):
+    source_table = multi_source_batch.comparison_table_name
+    result = multi_source_batch.base_batch.validate(
+        gxe.ExpectQueryResultsToMatchComparison(
+            comparison_data_source_name=multi_source_batch.comparison_data_source_name,
+            comparison_query=f"SELECT foo FROM {source_table}",
+            base_query="SELECT bar FROM {batch}",
+        )
+    )
+    result.render()
+
+    assert result.rendered_content == [
+        RenderedAtomicContent(
+            name=AtomicDiagnosticRendererType.OBSERVED_VALUE,
+            value_type="StringValueType",
+            value=RenderedAtomicValue(
+                schema={"type": "com.superconductive.rendered.string"},
+                template="Observed value: $base_value",
+                params={
+                    "base_value": {
+                        "schema": RendererSchema(type=RendererValueType.NUMBER),
+                        "value": 2,
+                    },
+                },
+            ),
+        ),
+        RenderedAtomicContent(
+            name=AtomicDiagnosticRendererType.OBSERVED_VALUE,
+            value_type="StringValueType",
+            value=RenderedAtomicValue(
+                schema={"type": "com.superconductive.rendered.string"},
+                template="Expected value: $comparison_value",
+                params={
+                    "comparison_value": {
+                        "schema": RendererSchema(type=RendererValueType.NUMBER),
+                        "value": 1,
+                    },
+                },
+            ),
+        ),
+    ]
