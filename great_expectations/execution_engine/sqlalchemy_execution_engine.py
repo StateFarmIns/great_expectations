@@ -1280,9 +1280,7 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
             if not isinstance(query, str):
                 raise ValueError(f"SQL query should be a str but got {query}")  # noqa: TRY003 # FIXME CoP
             # Query is a valid SELECT query that begins with r"\w+select\w"
-            selectable = sa.select(
-                sa.text(query.lstrip()[6:].strip().rstrip(";").rstrip())
-            ).subquery()
+            selectable = sa.text(query).columns().subquery()
 
         return selectable
 
