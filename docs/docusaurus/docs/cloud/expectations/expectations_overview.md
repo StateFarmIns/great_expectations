@@ -130,7 +130,9 @@ When you select your `n` run count, and:
 
 Forecasted ranges are determined by GX Cloud through a continuous learning algorithm that analyzes historical patterns in your data. For example, a forecasted range for volume Anomaly Detection could detect a sudden increase when volume has been stable or stagnation in a season when volume typically grows. GX Cloud sets and updates forecasted range parameters on your behalf. 
 
-Expectations with forecasted ranges will always succeed for the first 2 validation runs. This is because GX Cloud needs at least 2 data points to produce a forecast.
+Keep the following in mind when working with forecasted ranges:
+- Expectations with forecasted ranges will always succeed for the first 2 validation runs. This is because GX Cloud needs at least 2 data points to produce a forecast.
+- Forecasted ranges are not supported for incrementally validated Batches of data.
 
 ## Expectation condition
 
@@ -145,6 +147,20 @@ You will need to select:
 ![GX Cloud Expectation condition field](./expectation_images/expectation_condition_field.png)
 
 ![GX Cloud Expectation with condition](./expectation_images/expectation_with_condition.png)
+
+## Failure severity
+
+Every Expectation is assigned a severity level of critical, warning, or info that indicates the impact of the Expectation failing. Failure severity indicators are surfaced throughout GX Cloud to help your team understand the quality of your data. This includes high-level information like the overall status of a Data Asset as well as granular details like individual results in Validation run history.  
+
+You can use the following to create severity-based responses to results:
+- [Actions](/cloud/alerts/trigger_actions.md) that send notifications to Slack, Microsoft Teams, and Email.
+- Pipeline conditioning with the `get_maximum_severity_failure` helper method in the [`ExpectationSuiteValidationResult` class](/reference/api/core//ExpectationSuiteValidationResult_class.mdx).
+
+You decide the severity when you manually create an Expectation. When you have GX Cloud generate Expectations, they default to warning severity, which you can edit later. If an Expectation fails to execute, the failure will be recorded as critical, regardless of the Expectation configuration, to bring your attention to the fact that your data is not being tested as intended.
+
+:::note Default severity for Expectations created before September 10, 2025
+Expectations created before severity levels were introduced have been backfilled with critical severity. You can change this by [editing your Expectations](/cloud/expectations/manage_expectations.md#edit-an-expectation).
+:::
 
 ## GX-managed vs. API-managed Expectations
 
