@@ -98,6 +98,34 @@ class QueryMetricProvider(MetricProvider):
         else:
             return {**query_parameters}
 
+    # @classmethod
+    # def _get_substituted_batch_subquery_from_query_and_batch_selectable(
+    #     cls,
+    #     query: str,
+    #     batch_selectable: sa.Selectable,
+    #     execution_engine: SqlAlchemyExecutionEngine,
+    #     query_parameters: Optional[QueryParameters] = None,
+    # ) -> str:
+    #     parameters = cls._get_parameters_dict_from_query_parameters(query_parameters)
+
+    #     if isinstance(batch_selectable, sa.Table):
+    #         query = query.format(batch=batch_selectable, **parameters)
+    #     elif isinstance(
+    #         batch_selectable, (sa.sql.Select, get_sqlalchemy_subquery_type())
+    #     ):  # specifying a row_condition returns the active batch as a Select
+    #         # specifying an unexpected_rows_query returns the active batch as a Subquery or Alias
+    #         # this requires compilation & aliasing when formatting the parameterized query
+    #         batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
+    #         # all join queries require the user to have taken care of aliasing themselves
+    #         if "JOIN" in query.upper():
+    #             query = query.format(batch=f"({batch})", **parameters)
+    #         else:
+    #             query = query.format(batch=f"({batch}) AS subselect", **parameters)
+    #     else:
+    #         query = query.format(batch=f"({batch_selectable})", **parameters)
+
+    #     return query
+    
     @classmethod
     def _get_substituted_batch_subquery_from_query_and_batch_selectable(
         cls,
@@ -115,16 +143,20 @@ class QueryMetricProvider(MetricProvider):
         ):  # specifying a row_condition returns the active batch as a Select
             # specifying an unexpected_rows_query returns the active batch as a Subquery or Alias
             # this requires compilation & aliasing when formatting the parameterized query
-            batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
+            
             # all join queries require the user to have taken care of aliasing themselves
             if "JOIN" in query.upper():
+                batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
                 query = query.format(batch=f"({batch})", **parameters)
             else:
-                query = query.format(batch=f"({batch}) AS subselect", **parameters)
+                aliased_batch = batch_selectable.alias("subselect")
+                batch = aliased_batch.compile(compile_kwargs={"literal_binds": True})
+                query = query.format(batch=f"({str(batch)})", **parameters)
         else:
             query = query.format(batch=f"({batch_selectable})", **parameters)
 
         return query
+
 
     @classmethod
     def _get_sqlalchemy_records_from_substituted_batch_subquery(

@@ -23,6 +23,36 @@ class QueryRowCount(QueryMetricProvider):
     metric_name = "query.row_count"
     value_keys = ("query",)
 
+    # @metric_value(engine=SqlAlchemyExecutionEngine)
+    # def _sqlalchemy(
+    #     cls,
+    #     execution_engine: SqlAlchemyExecutionEngine,
+    #     metric_domain_kwargs: dict,
+    #     metric_value_kwargs: dict,
+    #     metrics: Dict[str, Any],
+    #     runtime_configuration: dict,
+    # ) -> int:
+    #     batch_selectable, _, _ = execution_engine.get_compute_domain(
+    #         metric_domain_kwargs, domain_type=MetricDomainTypes.TABLE
+    #     )
+    #     query = cls._get_query_from_metric_value_kwargs(metric_value_kwargs)
+    #     substituted_batch_subquery = (
+    #         cls._get_substituted_batch_subquery_from_query_and_batch_selectable(
+    #             query=query,
+    #             batch_selectable=batch_selectable,
+    #             execution_engine=execution_engine,
+    #         )
+    #     )
+    #     count_column_name = "unexpected_row_count"
+    #     row_count_query = (
+    #         f"SELECT COUNT(*) as {count_column_name} FROM "
+    #         f"({substituted_batch_subquery}) AS substituted_batch_subquery"
+    #     )
+    #     result: Union[Sequence[sa.Row[Any]], Any] = execution_engine.execute_query(
+    #         sa.text(row_count_query)
+    #     ).fetchone()
+    #     return int(result[0])
+
     @metric_value(engine=SqlAlchemyExecutionEngine)
     def _sqlalchemy(
         cls,
@@ -44,12 +74,12 @@ class QueryRowCount(QueryMetricProvider):
             )
         )
         count_column_name = "unexpected_row_count"
-        row_count_query = (
-            f"SELECT COUNT(*) as {count_column_name} FROM "
-            f"({substituted_batch_subquery}) AS substituted_batch_subquery"
-        )
+        subquery_text = sa.text(substituted_batch_subquery)
+        subquery_alias = subquery_text.columns().subquery("substituted_batch_subquery")
+        row_count_query = sa.select(sa.func.count().label(count_column_name)).select_from(subquery_alias)
+
         result: Union[Sequence[sa.Row[Any]], Any] = execution_engine.execute_query(
-            sa.text(row_count_query)
+            row_count_query
         ).fetchone()
         return int(result[0])
 
