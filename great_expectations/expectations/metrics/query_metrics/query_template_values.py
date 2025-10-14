@@ -39,64 +39,6 @@ class QueryTemplateValues(QueryMetricProvider):
         query_reformatted = query.format(**template_dict_reformatted, batch=selectable)
         return query_reformatted
 
-    # @metric_value(engine=SqlAlchemyExecutionEngine)
-    # def _sqlalchemy(
-    #     cls,
-    #     execution_engine: SqlAlchemyExecutionEngine,
-    #     metric_domain_kwargs: dict,
-    #     metric_value_kwargs: dict,
-    #     metrics: Dict[str, Any],
-    #     runtime_configuration: dict,
-    # ) -> List[dict]:
-    #     query = cls._get_query_from_metric_value_kwargs(metric_value_kwargs)
-
-    #     selectable: Union[sa.sql.Selectable, str]
-    #     selectable, _, _ = execution_engine.get_compute_domain(
-    #         metric_domain_kwargs, domain_type=MetricDomainTypes.TABLE
-    #     )
-
-    #     template_dict = metric_value_kwargs.get("template_dict")
-
-    #     if not isinstance(template_dict, dict):
-    #         raise TypeError("template_dict supplied by the expectation must be a dict")  # noqa: TRY003 # FIXME CoP
-
-    #     if isinstance(selectable, sa.Table):
-    #         query = cls.get_query(query, template_dict, selectable)
-
-    #     elif isinstance(
-    #         selectable, get_sqlalchemy_subquery_type()
-    #     ):  # Specifying a runtime query in a RuntimeBatchRequest returns the active batch as a Subquery; sectioning  # noqa: E501 # FIXME CoP
-    #         # the active batch off w/ parentheses ensures flow of operations doesn't break
-    #         query = cls.get_query(query, template_dict, f"({selectable})")
-
-    #     elif isinstance(
-    #         selectable, sa.sql.Select
-    #     ):  # Specifying a row_condition returns the active batch as a Select object, requiring compilation &  # noqa: E501 # FIXME CoP
-    #         # aliasing when formatting the parameterized query
-    #         query = cls.get_query(
-    #             query,
-    #             template_dict,
-    #             f"({selectable.compile(compile_kwargs={'literal_binds': True})}) AS subselect",
-    #         )
-
-    #     else:
-    #         query = cls.get_query(query, template_dict, f"({selectable})")
-
-    #     try:
-    #         result: Union[Sequence[sa.Row[Any]], Any] = execution_engine.execute_query(
-    #             sa.text(query)
-    #         ).fetchall()
-    #     except Exception as e:
-    #         if hasattr(e, "_query_id"):
-    #             # query_id removed because it duplicates the validation_results
-    #             e._query_id = None
-    #         raise e  # noqa: TRY201 # FIXME CoP
-
-    #     if isinstance(result, Sequence):
-    #         return [element._asdict() for element in result]
-    #     else:
-    #         return [result]
-
     @metric_value(engine=SqlAlchemyExecutionEngine)
     def _sqlalchemy(
         cls,
@@ -131,14 +73,14 @@ class QueryTemplateValues(QueryMetricProvider):
             selectable, sa.sql.Select
         ):  # Specifying a row_condition returns the active batch as a Select object, requiring compilation &  # noqa: E501 # FIXME CoP
             # aliasing when formatting the parameterized query
-           
-            aliased_selectable = selectable.alias("subselect") 
+
+            aliased_selectable = selectable.alias("subselect")
             compiled_alias = aliased_selectable.compile(compile_kwargs={"literal_binds": True})
 
             query = cls.get_query(
                 query,
                 template_dict,
-                f"({str(compiled_alias)})",
+                f"({compiled_alias!s})",
             )
 
         else:

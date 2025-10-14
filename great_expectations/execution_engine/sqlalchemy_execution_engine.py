@@ -1144,22 +1144,6 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
 
         return sa.select("*").select_from(selectable).where(partition_clause)  # type: ignore[arg-type] # FIXME CoP
 
-    # def _subselectable(self, batch_spec: BatchSpec) -> sqlalchemy.Selectable:
-    #     table_name = batch_spec.get("table_name")
-    #     query = batch_spec.get("query")
-    #     selectable: sqlalchemy.Selectable
-    #     if table_name:
-    #         selectable = sa.table(table_name, schema=batch_spec.get("schema_name", None))
-    #     else:
-    #         if not isinstance(query, str):
-    #             raise ValueError(f"SQL query should be a str but got {query}")  # noqa: TRY003 # FIXME CoP
-    #         # Query is a valid SELECT query that begins with r"\w+select\w"
-    #         selectable = sa.select(
-    #             sa.text(query.lstrip()[6:].strip().rstrip(";").rstrip())
-    #         ).subquery()
-
-    #     return selectable
-
     def _subselectable(self, batch_spec: BatchSpec) -> sqlalchemy.Selectable:
         table_name = batch_spec.get("table_name")
         query = batch_spec.get("query")
@@ -1169,7 +1153,7 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
         else:
             if not isinstance(query, str):
                 raise ValueError(f"SQL query should be a str but got {query}")  # noqa: TRY003 # FIXME CoP
-            
+
             selectable = sa.text(query).columns().subquery()
 
         return selectable
