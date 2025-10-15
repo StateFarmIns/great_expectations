@@ -129,7 +129,6 @@ class QueryMetricProvider(MetricProvider):
 
         return query
 
-
     @classmethod
     def _get_sqlalchemy_records_from_substituted_batch_subquery(
         cls,

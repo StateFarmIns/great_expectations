@@ -46,9 +46,8 @@ class QueryRowCount(QueryMetricProvider):
         count_column_name = "unexpected_row_count"
         subquery_text = sa.text(substituted_batch_subquery)
         subquery_alias = subquery_text.columns().subquery("substituted_batch_subquery")
-        row_count_query = (
-            sa.select(sa.func.count().label(count_column_name))
-            .select_from(subquery_alias)
+        row_count_query = sa.select(sa.func.count().label(count_column_name)).select_from(
+            subquery_alias
         )
         result: Union[Sequence[sa.Row[Any]], Any] = execution_engine.execute_query(
             row_count_query

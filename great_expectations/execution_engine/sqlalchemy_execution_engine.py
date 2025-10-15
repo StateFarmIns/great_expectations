@@ -57,7 +57,9 @@ from great_expectations.expectations.model_field_types import (
     CONDITION_PARSER_GREAT_EXPECTATIONS,
     CONDITION_PARSER_GREAT_EXPECTATIONS_DEPRECATED,
 )
-from great_expectations.util import convert_to_json_serializable  # noqa: TID251 # FIXME CoP
+from great_expectations.util import (
+    convert_to_json_serializable,  # noqa: TID251 # Required for SQL result serialization
+)
 from great_expectations.validator.computed_metric import MetricValue  # noqa: TC001 # FIXME CoP
 
 del get_versions  # isort:skip
@@ -153,6 +155,7 @@ _PERSISTED_CONNECTION_DIALECTS = (
     GXSqlDialect.SQLITE,
     GXSqlDialect.MSSQL,
     GXSqlDialect.BIGQUERY,
+    GXSqlDialect.DATABRICKS,
 )
 
 
@@ -896,8 +899,54 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
 
         return PartitionDomainKwargs(compute_domain_kwargs, accessor_domain_kwargs)
 
+
+class SAQueryBuilder:
+    """Helper class to build SQLAlchemy query objects from selectables and select expressions."""
+
+    @staticmethod
+    def build(selectable: Any, selects: list) -> Any:
+        # If a custom query is passed, selectable may be a TextClause and not
+        # formatted as a subquery wrapped in "(subquery) alias". TextClause must
+        # first be converted to a TextualSelect using sa.columns() before it can
+        # be converted to type Subquery.
+        if sqlalchemy.TextClause and isinstance(selectable, sqlalchemy.TextClause):  # type: ignore[truthy-function]
+            return sa.select(*selects).select_from(selectable.columns().subquery())
+
+        if (sqlalchemy.Select and isinstance(selectable, sqlalchemy.Select)) or (
+            sqlalchemy.TextualSelect and isinstance(selectable, sqlalchemy.TextualSelect)
+        ):
+            return sa.select(*selects).select_from(selectable.subquery())
+
+        return sa.select(*selects).select_from(selectable)  # type: ignore[arg-type]
+
+
+class SAQueryExecutor:
+    """Helper class to execute SQLAlchemy query objects and fetch results."""
+
+    def __init__(self, engine_instance: Any) -> None:
+        self._engine_instance = engine_instance
+
+    def execute(self, sa_query_object: Any, domain_kwargs: dict) -> List[Any]:
+        logger.debug("Attempting query %s", sa_query_object)
+        try:
+            res = self._engine_instance.execute_query(sa_query_object).fetchall()  # type: ignore[assignment]
+            logger.debug(
+                "SqlAlchemyExecutionEngine computed %d metrics on domain_id %s",
+                len(res[0]),
+                IDDict(domain_kwargs).to_id(),
+            )
+            return res
+        except sqlalchemy.OperationalError as oe:
+            exception_message: str = "An SQL execution Exception occurred.  "
+            exception_traceback: str = traceback.format_exc()
+            exception_message += (
+                f'{type(oe).__name__}: "{oe!s}".  Traceback: "{exception_traceback}".'
+            )
+            logger.error(exception_message)  # noqa: TRY400 # FIXME CoP
+            raise ExecutionEngineError(message=exception_message)
+
     @override
-    def resolve_metric_bundle(  # noqa: C901 #  too complex
+    def resolve_metric_bundle(
         self,
         metric_fn_bundle: Iterable[MetricComputationConfiguration],
     ) -> dict[MetricConfigurationID, MetricValue]:
@@ -962,38 +1011,10 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
 
             assert len(query["select"]) == len(query["metric_ids"])
 
-            try:
-                """
-                If a custom query is passed, selectable will be TextClause and not formatted
-                as a subquery wrapped in "(subquery) alias". TextClause must first be converted
-                to TextualSelect using sa.columns() before it can be converted to type Subquery
-                """
-                if sqlalchemy.TextClause and isinstance(selectable, sqlalchemy.TextClause):  # type: ignore[truthy-function] # FIXME CoP
-                    sa_query_object = sa.select(*query["select"]).select_from(
-                        selectable.columns().subquery()
-                    )
-                elif (sqlalchemy.Select and isinstance(selectable, sqlalchemy.Select)) or (  # type: ignore[truthy-function] # FIXME CoP
-                    sqlalchemy.TextualSelect and isinstance(selectable, sqlalchemy.TextualSelect)  # type: ignore[truthy-function] # FIXME CoP
-                ):
-                    sa_query_object = sa.select(*query["select"]).select_from(selectable.subquery())
-                else:
-                    sa_query_object = sa.select(*query["select"]).select_from(selectable)  # type: ignore[arg-type] # FIXME CoP
-
-                logger.debug(f"Attempting query {sa_query_object!s}")
-                res = self.execute_query(sa_query_object).fetchall()  # type: ignore[assignment] # FIXME CoP
-
-                logger.debug(
-                    f"""SqlAlchemyExecutionEngine computed {len(res[0])} metrics on domain_id \
-{IDDict(domain_kwargs).to_id()}"""
-                )
-            except sqlalchemy.OperationalError as oe:
-                exception_message: str = "An SQL execution Exception occurred.  "
-                exception_traceback: str = traceback.format_exc()
-                exception_message += (
-                    f'{type(oe).__name__}: "{oe!s}".  Traceback: "{exception_traceback}".'
-                )
-                logger.error(exception_message)  # noqa: TRY400 # FIXME CoP
-                raise ExecutionEngineError(message=exception_message)
+            # Build the SQLAlchemy query object and execute it via helpers to
+            # keep resolve_metric_bundle focused on bundling/mapping logic.
+            sa_query_object = self._build_sa_query_object(selectable, query["select"])
+            res = self._execute_query_and_get_results(sa_query_object, domain_kwargs)
 
             assert len(res) == 1, "all bundle-computed metrics must be single-value statistics"
             assert len(query["metric_ids"]) == len(res[0]), "unexpected number of metrics returned"
@@ -1157,7 +1178,6 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
             selectable = sa.text(query).columns().subquery()
 
         return selectable
-
 
     @override
     def get_batch_data_and_markers(
