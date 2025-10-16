@@ -60,7 +60,6 @@ from great_expectations.expectations.model_field_types import (
 from great_expectations.util import (
     convert_to_json_serializable,  # noqa: TID251 # Required for SQL result serialization
 )
-from great_expectations.validator.computed_metric import MetricValue  # noqa: TC001 # FIXME CoP
 
 del get_versions  # isort:skip
 
@@ -98,12 +97,17 @@ from great_expectations.util import (
 )
 
 if TYPE_CHECKING:
+    from great_expectations.validator.computed_metric import (
+        MetricValue,
+    )
     from great_expectations.validator.metric_configuration import (
         MetricConfiguration,
         MetricConfigurationID,
     )
 
+
 logger = logging.getLogger(__name__)
+DATABRICKS_MAX_PARAMS_PER_QUERY = 256
 
 
 if sa:
@@ -149,6 +153,8 @@ except ImportError:
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine as SaEngine  # noqa: TID251 # FIXME CoP
+
+    from great_expectations.compatibility import sqlalchemy
 
 
 _PERSISTED_CONNECTION_DIALECTS = (
@@ -366,7 +372,15 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
                 sa.event.listen(self.engine, "connect", _on_connect)
                 # Also immediately add the sqlite functions in case there already exists an underlying  # noqa: E501 # FIXME CoP
                 # sqlite3.Connection (distinct from a sqlalchemy Connection).
-                _add_sqlite_functions(self.engine.raw_connection())
+                _raw_dbapi_con = self.engine.raw_connection()
+                try:
+                    _add_sqlite_functions(_raw_dbapi_con)
+                finally:
+                    # Ensure the temporary raw DB-API connection is closed to avoid ResourceWarning.
+                    try:
+                        _raw_dbapi_con.close()
+                    except Exception:
+                        pass
             self._engine_backup = self.engine
 
         # Gather the call arguments of the present function (and add the "class_name"), filter out the Falsy values,  # noqa: E501 # FIXME CoP
@@ -519,7 +533,7 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
             try:
                 p_key = serialization.load_pem_private_key(
                     key.read(),
-                    password=private_key_passphrase.encode() if private_key_passphrase else None,
+                    password=(private_key_passphrase.encode() if private_key_passphrase else None),
                     backend=default_backend(),
                 )
             except ValueError as e:
@@ -899,52 +913,6 @@ class SqlAlchemyExecutionEngine(ExecutionEngine):
 
         return PartitionDomainKwargs(compute_domain_kwargs, accessor_domain_kwargs)
 
-
-class SAQueryBuilder:
-    """Helper class to build SQLAlchemy query objects from selectables and select expressions."""
-
-    @staticmethod
-    def build(selectable: Any, selects: list) -> Any:
-        # If a custom query is passed, selectable may be a TextClause and not
-        # formatted as a subquery wrapped in "(subquery) alias". TextClause must
-        # first be converted to a TextualSelect using sa.columns() before it can
-        # be converted to type Subquery.
-        if sqlalchemy.TextClause and isinstance(selectable, sqlalchemy.TextClause):  # type: ignore[truthy-function]
-            return sa.select(*selects).select_from(selectable.columns().subquery())
-
-        if (sqlalchemy.Select and isinstance(selectable, sqlalchemy.Select)) or (
-            sqlalchemy.TextualSelect and isinstance(selectable, sqlalchemy.TextualSelect)
-        ):
-            return sa.select(*selects).select_from(selectable.subquery())
-
-        return sa.select(*selects).select_from(selectable)  # type: ignore[arg-type]
-
-
-class SAQueryExecutor:
-    """Helper class to execute SQLAlchemy query objects and fetch results."""
-
-    def __init__(self, engine_instance: Any) -> None:
-        self._engine_instance = engine_instance
-
-    def execute(self, sa_query_object: Any, domain_kwargs: dict) -> List[Any]:
-        logger.debug("Attempting query %s", sa_query_object)
-        try:
-            res = self._engine_instance.execute_query(sa_query_object).fetchall()  # type: ignore[assignment]
-            logger.debug(
-                "SqlAlchemyExecutionEngine computed %d metrics on domain_id %s",
-                len(res[0]),
-                IDDict(domain_kwargs).to_id(),
-            )
-            return res
-        except sqlalchemy.OperationalError as oe:
-            exception_message: str = "An SQL execution Exception occurred.  "
-            exception_traceback: str = traceback.format_exc()
-            exception_message += (
-                f'{type(oe).__name__}: "{oe!s}".  Traceback: "{exception_traceback}".'
-            )
-            logger.error(exception_message)  # noqa: TRY400 # FIXME CoP
-            raise ExecutionEngineError(message=exception_message)
-
     @override
     def resolve_metric_bundle(
         self,
@@ -967,54 +935,51 @@ class SAQueryExecutor:
 
         res: List[sqlalchemy.Row]
 
-        # We need a different query for each Domain (where clause).
-        queries: dict[IDDictID, dict] = {}
+        queries: list[dict] = self._organize_metrics_by_domain(
+            metric_fn_bundle,
+            limit=DATABRICKS_MAX_PARAMS_PER_QUERY
+            if self.engine.dialect.name.lower() == GXSqlDialect.DATABRICKS
+            else None,
+        )
 
-        query: dict
-
-        domain_id: IDDictID
-
-        bundled_metric_configuration: MetricComputationConfiguration
-        for bundled_metric_configuration in metric_fn_bundle:
-            metric_to_resolve: MetricConfiguration = (
-                bundled_metric_configuration.metric_configuration
-            )
-            metric_fn: Any = bundled_metric_configuration.metric_fn
-            compute_domain_kwargs: dict = bundled_metric_configuration.compute_domain_kwargs or {}
-            if not isinstance(compute_domain_kwargs, IDDict):
-                compute_domain_kwargs = IDDict(compute_domain_kwargs)
-
-            domain_id = compute_domain_kwargs.to_id()
-            if domain_id not in queries:
-                queries[domain_id] = {
-                    "select": [],
-                    "metric_ids": [],
-                    "domain_kwargs": compute_domain_kwargs,
-                }
-
-            if self.engine.dialect.name == "clickhouse":
-                queries[domain_id]["select"].append(
-                    metric_fn.label(
-                        metric_to_resolve.metric_name.join(
-                            random.choices(string.ascii_lowercase, k=4)
-                        )
-                    )
-                )
-            else:
-                queries[domain_id]["select"].append(metric_fn.label(metric_to_resolve.metric_name))
-
-            queries[domain_id]["metric_ids"].append(metric_to_resolve.id)
-
-        for query in queries.values():
+        for query in queries:
             domain_kwargs: dict = query["domain_kwargs"]
             selectable: sqlalchemy.Selectable = self.get_domain_records(domain_kwargs=domain_kwargs)
 
             assert len(query["select"]) == len(query["metric_ids"])
 
-            # Build the SQLAlchemy query object and execute it via helpers to
-            # keep resolve_metric_bundle focused on bundling/mapping logic.
-            sa_query_object = self._build_sa_query_object(selectable, query["select"])
-            res = self._execute_query_and_get_results(sa_query_object, domain_kwargs)
+            try:
+                """
+                If a custom query is passed, selectable will be TextClause and not formatted
+                as a subquery wrapped in "(subquery) alias". TextClause must first be converted
+                to TextualSelect using sa.columns() before it can be converted to type Subquery
+                """
+                if sqlalchemy.TextClause and isinstance(selectable, sqlalchemy.TextClause):  # type: ignore[truthy-function] # FIXME CoP
+                    sa_query_object = sa.select(*query["select"]).select_from(
+                        selectable.columns().subquery()
+                    )
+                elif (sqlalchemy.Select and isinstance(selectable, sqlalchemy.Select)) or (  # type: ignore[truthy-function] # FIXME CoP
+                    sqlalchemy.TextualSelect and isinstance(selectable, sqlalchemy.TextualSelect)  # type: ignore[truthy-function] # FIXME CoP
+                ):
+                    sa_query_object = sa.select(*query["select"]).select_from(selectable.subquery())
+                else:
+                    sa_query_object = sa.select(*query["select"]).select_from(selectable)  # type: ignore[arg-type] # FIXME CoP
+
+                logger.debug(f"Attempting query {sa_query_object!s}")
+                res = self.execute_query(sa_query_object).fetchall()  # type: ignore[assignment] # FIXME CoP
+
+                logger.debug(
+                    f"""SqlAlchemyExecutionEngine computed {len(res[0])} metrics on domain_id \
+{IDDict(domain_kwargs).to_id()}"""
+                )
+            except sqlalchemy.OperationalError as oe:
+                exception_message: str = "An SQL execution Exception occurred.  "
+                exception_traceback: str = traceback.format_exc()
+                exception_message += (
+                    f'{type(oe).__name__}: "{oe!s}".  Traceback: "{exception_traceback}".'
+                )
+                logger.error(exception_message)  # noqa: TRY400 # FIXME CoP
+                raise ExecutionEngineError(message=exception_message)
 
             assert len(res) == 1, "all bundle-computed metrics must be single-value statistics"
             assert len(query["metric_ids"]) == len(res[0]), "unexpected number of metrics returned"
@@ -1052,6 +1017,162 @@ class SAQueryExecutor:
             self._engine_backup.dispose()
         else:
             self.engine.dispose()
+
+    def _finalize_domain_query(
+        self,
+        domain_id: IDDictID,
+        domain_batches: dict,
+        batch_counters: dict,
+        domain_kwargs_map: dict,
+    ) -> tuple[IDDictID | None, dict | None, int | None]:
+        """Finalize the current accumulated metrics for a domain into a query.
+
+        This method calculates what new query entry should be added and what
+        batch state should be reset for the next parameter batch.
+
+        Returns:
+            Tuple of (final_domain_id, new_query_entry, new_batch_counter)
+            Returns (None, None, None) if no finalization is needed
+        """
+        new_query_entry = None
+        new_batch_counter = None
+        final_domain_id = None
+
+        if domain_id in domain_batches and domain_batches[domain_id]["select"]:
+            batch_idx = batch_counters.get(domain_id, 0)
+            domain_kwargs = domain_kwargs_map[domain_id]
+
+            if batch_idx == 0:
+                final_domain_id = domain_id
+            else:
+                final_domain_id = IDDict({**domain_kwargs, "_batch_idx": batch_idx}).to_id()
+
+            new_query_entry = {
+                "select": domain_batches[domain_id]["select"],
+                "metric_ids": domain_batches[domain_id]["metric_ids"],
+                "domain_kwargs": domain_kwargs,
+            }
+            new_batch_counter = batch_idx + 1
+
+            return final_domain_id, new_query_entry, new_batch_counter
+
+        return final_domain_id, new_query_entry, new_batch_counter
+
+    def _organize_metrics_by_domain(  # noqa: C901 # FIXME
+        self,
+        metric_fn_bundle: Iterable[MetricComputationConfiguration],
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Organize metrics from a bundle into domain-grouped queries.
+
+        Args:
+            metric_fn_bundle: The metric bundle containing configurations to organize.
+            limit: The maximum number of parameters per query.
+
+        Returns:
+            Dictionary of domain IDs mapped to query configurations
+            with select expressions and metric IDs.
+        """
+        queries: list[dict] = []
+        domain_batches: dict[IDDictID, dict] = {}
+        batch_counters: dict[IDDictID, int] = {}
+        domain_kwargs_map: dict[IDDictID, dict] = {}
+
+        for bundled_metric_configuration in metric_fn_bundle:
+            metric_to_resolve: MetricConfiguration = (
+                bundled_metric_configuration.metric_configuration
+            )
+            metric_fn: Any = bundled_metric_configuration.metric_fn
+            domain_kwargs: dict = bundled_metric_configuration.compute_domain_kwargs or {}
+            if not isinstance(domain_kwargs, IDDict):
+                domain_kwargs = IDDict(domain_kwargs)
+
+            domain_id = domain_kwargs.to_id()
+            selectable: sqlalchemy.Selectable = self.get_domain_records(domain_kwargs=domain_kwargs)
+
+            if domain_id not in domain_batches:
+                domain_batches[domain_id] = {"select": [], "metric_ids": []}
+                batch_counters[domain_id] = 0
+                domain_kwargs_map[domain_id] = domain_kwargs
+
+            if limit:
+                test_selects = domain_batches[domain_id]["select"] + [
+                    metric_fn.label(metric_to_resolve.metric_name)
+                ]
+                test_param_count = self._count_query_parameters(selectable, test_selects)
+
+                if test_param_count > limit and domain_batches[domain_id]["select"]:
+                    (
+                        final_domain_id,
+                        new_query_entry,
+                        new_batch_counter,
+                    ) = self._finalize_domain_query(
+                        domain_id, domain_batches, batch_counters, domain_kwargs_map
+                    )
+                    if final_domain_id is not None:
+                        assert new_query_entry is not None
+                        assert new_batch_counter is not None
+                        queries.append(new_query_entry)
+                        domain_batches[domain_id] = {"select": [], "metric_ids": []}
+                        batch_counters[domain_id] = new_batch_counter
+
+            if self.engine.dialect.name.lower() == GXSqlDialect.CLICKHOUSE:
+                domain_batches[domain_id]["select"].append(
+                    metric_fn.label(
+                        metric_to_resolve.metric_name.join(
+                            random.choices(string.ascii_lowercase, k=4)
+                        )
+                    )
+                )
+                domain_batches[domain_id]["metric_ids"].append(metric_to_resolve.id)
+            else:
+                domain_batches[domain_id]["select"].append(
+                    metric_fn.label(metric_to_resolve.metric_name)
+                )
+                domain_batches[domain_id]["metric_ids"].append(metric_to_resolve.id)
+
+        for domain_id in list(domain_batches.keys()):
+            (
+                final_domain_id,
+                new_query_entry,
+                new_batch_counter,
+            ) = self._finalize_domain_query(
+                domain_id, domain_batches, batch_counters, domain_kwargs_map
+            )
+            if final_domain_id is not None:
+                assert new_query_entry is not None
+                assert new_batch_counter is not None
+                queries.append(new_query_entry)
+                domain_batches[domain_id] = {"select": [], "metric_ids": []}
+                batch_counters[domain_id] = new_batch_counter
+
+        return queries
+
+    def _count_query_parameters(self, selectable: sqlalchemy.Selectable, select_list: list) -> int:
+        """Count the total number of parameters in a query with the given select expressions.
+
+        Args:
+            selectable: The base selectable object
+            select_list: List of SELECT expressions to include in the query
+
+        Returns:
+            Total number of parameters that would be generated when the query is compiled
+        """
+        DEFAULT_PARAMS_PER_SELECT = 2  # Conservative upper bound
+        if isinstance(selectable, sqlalchemy.TextClause):
+            test_query = sa.select(*select_list).select_from(selectable.columns().subquery())
+        elif isinstance(selectable, (sqlalchemy.Select, sqlalchemy.TextualSelect)):
+            test_query = sa.select(*select_list).select_from(selectable.subquery())
+        elif isinstance(selectable, sa.sql.FromClause):
+            test_query = sa.select(*select_list).select_from(selectable)
+        else:
+            return len(select_list) * DEFAULT_PARAMS_PER_SELECT
+        try:
+            compiled = test_query.compile(dialect=self.engine.dialect)
+            return len(compiled.params)
+        except Exception:
+            # If compilation fails, fall back to conservative upper bound estimate
+            return len(select_list) * DEFAULT_PARAMS_PER_SELECT
 
     def _get_partitioner_method(self, partitioner_method_name: str) -> Callable:
         """Get the appropriate partitioner method from the method name.
@@ -1174,7 +1295,6 @@ class SAQueryExecutor:
         else:
             if not isinstance(query, str):
                 raise ValueError(f"SQL query should be a str but got {query}")  # noqa: TRY003 # FIXME CoP
-
             selectable = sa.text(query).columns().subquery()
 
         return selectable
