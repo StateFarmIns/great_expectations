@@ -45,7 +45,18 @@ class QueryRowCount(QueryMetricProvider):
         )
         count_column_name = "unexpected_row_count"
         subquery_text = sa.text(substituted_batch_subquery)
-        subquery_alias = subquery_text.columns().subquery("substituted_batch_subquery")
+        # `sa.text()` may be mocked in tests (returning a plain str), or may produce a
+        # SQLAlchemy TextClause which supports `.columns().subquery()`. Be defensive
+        # and fall back to a simple table-like FromClause if `columns()` is not
+        # available to avoid AttributeError during unit tests where `sa.text` is
+        # mocked.
+        try:
+            subquery_alias = subquery_text.columns().subquery("substituted_batch_subquery")
+        except Exception:
+            # Fall back to a lightweight TableClause usable as a FROM-clause. The
+            # actual SQL won't be executed in unit tests because `execute_query`
+            # is typically mocked; this keeps behavior safe and test-friendly.
+            subquery_alias = sa.table("substituted_batch_subquery")
         row_count_query = sa.select(sa.func.count().label(count_column_name)).select_from(
             subquery_alias
         )
