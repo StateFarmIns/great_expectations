@@ -59,6 +59,7 @@ from great_expectations.execution_engine.partition_and_sample.sparkdf_data_sampl
     SparkDataSampler,
 )
 from great_expectations.execution_engine.sparkdf_batch_data import SparkDFBatchData
+from great_expectations.expectations.conditions import Operator
 from great_expectations.expectations.model_field_types import (
     CONDITION_PARSER_GREAT_EXPECTATIONS,
     CONDITION_PARSER_GREAT_EXPECTATIONS_DEPRECATED,
@@ -933,16 +934,24 @@ illegal.  Please check your config."""  # noqa: E501 # FIXME CoP
 
     @override
     def _comparison_condition_to_filter_clause(self, condition: ComparisonCondition) -> str:
-        raise NotImplementedError
+        col, op, val = condition.column.name, condition.operator, condition.parameter
+        if op in (Operator.IN, Operator.NOT_IN):
+            values = ", ".join(map(repr, val))
+            connector = "IN" if op == Operator.IN else "NOT IN"
+            return f"{col} {connector} ({values})"
+        return f"{col} {op} {val!r}"
 
     @override
     def _nullity_condition_to_filter_clause(self, condition: NullityCondition) -> str:
-        raise NotImplementedError
+        col = condition.column.name
+        return f"{col} IS NULL" if condition.is_null else f"{col} IS NOT NULL"
 
     @override
     def _and_condition_to_filter_clause(self, condition: AndCondition) -> str:
-        raise NotImplementedError
+        parts = [self.condition_to_filter_clause(c) for c in condition.conditions]
+        return "(" + " AND ".join(parts) + ")"
 
     @override
     def _or_condition_to_filter_clause(self, condition: OrCondition) -> str:
-        raise NotImplementedError
+        parts = [self.condition_to_filter_clause(c) for c in condition.conditions]
+        return "(" + " OR ".join(parts) + ")"
