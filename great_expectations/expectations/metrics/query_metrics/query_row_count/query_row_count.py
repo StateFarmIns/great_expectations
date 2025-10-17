@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, Sequence, Union, cast
 
 from great_expectations.compatibility.sqlalchemy import (
     sqlalchemy as sa,
@@ -50,13 +50,16 @@ class QueryRowCount(QueryMetricProvider):
         # and fall back to a simple table-like FromClause if `columns()` is not
         # available to avoid AttributeError during unit tests where `sa.text` is
         # mocked.
+        subquery_alias: Any
         try:
             subquery_alias = subquery_text.columns().subquery("substituted_batch_subquery")
         except Exception:
             # Fall back to a lightweight TableClause usable as a FROM-clause. The
             # actual SQL won't be executed in unit tests because `execute_query`
             # is typically mocked; this keeps behavior safe and test-friendly.
-            subquery_alias = sa.table("substituted_batch_subquery")
+            # Cast to Any so static type checkers accept this alternate runtime
+            # object used in tests.
+            subquery_alias = cast("Any", sa.table("substituted_batch_subquery"))
         row_count_query = sa.select(sa.func.count().label(count_column_name)).select_from(
             subquery_alias
         )
