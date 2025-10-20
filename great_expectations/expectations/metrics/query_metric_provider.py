@@ -107,25 +107,46 @@ class QueryMetricProvider(MetricProvider):
         query_parameters: Optional[QueryParameters] = None,
     ) -> str:
         parameters = cls._get_parameters_dict_from_query_parameters(query_parameters)
+        # Determine alias connector. Oracle does not allow the keyword 'AS' for
+        # table/subquery aliases, whereas other dialects commonly allow it.
+        alias_connector = " AS "
+        try:
+            sa_engine = getattr(execution_engine, "engine", None)
+            sa_dialect_name = sa_engine.dialect.name if sa_engine is not None else None
+        except Exception:
+            sa_dialect_name = None
+        if sa_dialect_name and sa_dialect_name.lower() == "oracle":
+            alias_connector = " "
 
         if isinstance(batch_selectable, sa.Table):
+            # Table objects can be formatted directly (no extra aliasing needed).
             query = query.format(batch=batch_selectable, **parameters)
-        elif isinstance(
-            batch_selectable, (sa.sql.Select, get_sqlalchemy_subquery_type())
-        ):  # specifying a row_condition returns the active batch as a Select
+        elif isinstance(batch_selectable, (sa.sql.Select, get_sqlalchemy_subquery_type())):
+            # specifying a row_condition returns the active batch as a Select
             # specifying an unexpected_rows_query returns the active batch as a Subquery or Alias
             # this requires compilation & aliasing when formatting the parameterized query
 
             # all join queries require the user to have taken care of aliasing themselves
             if "JOIN" in query.upper():
                 batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
-                query = query.format(batch=f"({batch})", **parameters)
+                query = query.format(
+                    batch=f"({batch}){alias_connector}substituted_batch_subquery",
+                    **parameters,
+                )
             else:
                 aliased_batch = batch_selectable.alias("subselect")
                 batch = aliased_batch.compile(compile_kwargs={"literal_binds": True})
-                query = query.format(batch=f"({batch!s})", **parameters)
+                query = query.format(
+                    batch=f"({batch!s}){alias_connector}substituted_batch_subquery",
+                    **parameters,
+                )
         else:
-            query = query.format(batch=f"({batch_selectable})", **parameters)
+            # Fallback: format the batch_selectable as a parenthesized fragment and
+            # provide a dialect-aware explicit alias to satisfy MySQL/others.
+            query = query.format(
+                batch=f"({batch_selectable}){alias_connector}substituted_batch_subquery",
+                **parameters,
+            )
 
         return query
 
