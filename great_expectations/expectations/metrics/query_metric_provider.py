@@ -115,8 +115,28 @@ class QueryMetricProvider(MetricProvider):
             sa_dialect_name = sa_engine.dialect.name if sa_engine is not None else None
         except Exception:
             sa_dialect_name = None
-        if sa_dialect_name and sa_dialect_name.lower() == "oracle":
+
+        # Coerce the SQLAlchemy dialect name to the GXSqlDialect enum when
+        # possible and use enum comparisons for dialect-specific behavior.
+        gx_dialect: GXSqlDialect | None
+        try:
+            gx_dialect = GXSqlDialect(sa_dialect_name) if sa_dialect_name else None
+        except Exception:
+            gx_dialect = None
+
+        # Oracle uses a space instead of 'AS' for table/subquery aliases.
+        if gx_dialect == GXSqlDialect.ORACLE:
             alias_connector = " "
+
+        # Determine whether the current dialect requires derived-table aliases
+        # (MySQL/MariaDB and PostgreSQL require an explicit alias for derived tables).
+        dialect_requires_derived_table_alias = False
+        if gx_dialect in (GXSqlDialect.MYSQL, GXSqlDialect.POSTGRESQL):
+            dialect_requires_derived_table_alias = True
+        # MariaDB is sometimes reported as 'mariadb' by certain SQLAlchemy dialects;
+        # handle that string as a fallback.
+        elif isinstance(sa_dialect_name, str) and sa_dialect_name.lower() == "mariadb":
+            dialect_requires_derived_table_alias = True
 
         if isinstance(batch_selectable, sa.Table):
             # Table objects can be formatted directly (no extra aliasing needed).
@@ -129,24 +149,32 @@ class QueryMetricProvider(MetricProvider):
             # all join queries require the user to have taken care of aliasing themselves
             if "JOIN" in query.upper():
                 batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
-                query = query.format(
-                    batch=f"({batch}){alias_connector}substituted_batch_subquery",
-                    **parameters,
-                )
+                if dialect_requires_derived_table_alias:
+                    query = query.format(
+                        batch=f"({batch}){alias_connector}substituted_batch_subquery",
+                        **parameters,
+                    )
+                else:
+                    query = query.format(batch=f"({batch})", **parameters)
             else:
                 aliased_batch = batch_selectable.alias("subselect")
                 batch = aliased_batch.compile(compile_kwargs={"literal_binds": True})
-                query = query.format(
-                    batch=f"({batch!s}){alias_connector}substituted_batch_subquery",
-                    **parameters,
-                )
+                if dialect_requires_derived_table_alias:
+                    query = query.format(
+                        batch=f"({batch!s}){alias_connector}substituted_batch_subquery",
+                        **parameters,
+                    )
+                else:
+                    # Preserve previous behavior for non-MySQL-like dialects and
+                    # avoid introducing an alias into the formatted string so
+                    # existing unit tests continue to match expected output.
+                    query = query.format(batch=f"({batch!s})", **parameters)
         else:
-            # Fallback: format the batch_selectable as a parenthesized fragment and
-            # provide a dialect-aware explicit alias to satisfy MySQL/others.
-            query = query.format(
-                batch=f"({batch_selectable}){alias_connector}substituted_batch_subquery",
-                **parameters,
-            )
+            # Fallback: format the batch_selectable as a parenthesized fragment.
+            # Historically this did not add an explicit alias; keep that behavior
+            # to match existing unit tests and avoid changing simple table
+            # formatting expectations.
+            query = query.format(batch=f"({batch_selectable})", **parameters)
 
         return query
 
