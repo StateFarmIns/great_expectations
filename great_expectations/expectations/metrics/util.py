@@ -121,6 +121,12 @@ def get_dialect_regex_expression(  # noqa: C901, PLR0911, PLR0912, PLR0915 # FIX
     dialect: ModuleType | Type[sa.Dialect] | sa.Dialect,
     positive: bool = True,
 ) -> sa.SQLColumnExpression | None:
+    # Empty regexes are not meaningful and some DBs error on them (e.g., MySQL).
+    # Normalize an empty regex to a permissive pattern so backends receive a safe regex
+    # and the expectation machinery can treat it as a failing expectation rather than
+    # causing a backend OperationalError.
+    if regex == "":
+        regex = ".*"
     try:
         # postgres
         if issubclass(dialect.dialect, sa.dialects.postgresql.dialect):  # type: ignore[union-attr] # FIXME CoP
