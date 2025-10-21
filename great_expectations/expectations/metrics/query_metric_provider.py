@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence, Union
 
 from typing_extensions import NotRequired, TypedDict
@@ -114,6 +115,15 @@ class QueryMetricProvider(MetricProvider):
             cls._get_aliasing_behavior_for_engine(execution_engine)
         )
 
+        # Detect whether the user already provided an alias after `{batch}`
+        # in the query (e.g. `FROM {batch} t1` or `FROM {batch} AS t1`). If the
+        # caller provides an alias, we must NOT append our own derived-table
+        # alias (that would produce `AS substituted_batch_subquery t1` and
+        # break MySQL syntax).
+        user_provided_alias = bool(
+            re.search(r"\{batch\}\s*(?:AS\s+)?[A-Za-z_]", query, flags=re.IGNORECASE)
+        )
+
         if isinstance(batch_selectable, sa.Table):
             # Table objects can be formatted directly (no extra aliasing needed).
             query = query.format(batch=batch_selectable, **parameters)
@@ -124,14 +134,24 @@ class QueryMetricProvider(MetricProvider):
 
             # all join queries require the user to have taken care of aliasing themselves
             if "JOIN" in query.upper():
+                # Use the raw selectable for compilation when the caller will
+                # supply an alias; otherwise compiled selectable can be
+                # aliased as needed.
                 batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
-                if dialect_requires_derived_table_alias:
+                if dialect_requires_derived_table_alias and not user_provided_alias:
                     query = query.format(
                         batch=f"({batch}){alias_connector}substituted_batch_subquery",
                         **parameters,
                     )
                 else:
                     query = query.format(batch=f"({batch})", **parameters)
+            # If the caller already provides an alias (e.g. `FROM {batch} t1`),
+            # compile the raw selectable and do not append our derived-table
+            # alias; otherwise, compile an aliased selectable and append
+            # the dialect-appropriate alias when required.
+            elif user_provided_alias:
+                batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
+                query = query.format(batch=f"({batch})", **parameters)
             else:
                 aliased_batch = batch_selectable.alias("subselect")
                 batch = aliased_batch.compile(compile_kwargs={"literal_binds": True})
@@ -141,9 +161,7 @@ class QueryMetricProvider(MetricProvider):
                         **parameters,
                     )
                 else:
-                    # Preserve previous behavior for non-MySQL-like dialects and
-                    # avoid introducing an alias into the formatted string so
-                    # existing unit tests continue to match expected output.
+                    # Preserve previous behavior for non-MySQL-like dialects
                     query = query.format(batch=f"({batch!s})", **parameters)
         else:
             # Fallback: format the batch_selectable as a parenthesized fragment.
