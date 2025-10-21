@@ -107,36 +107,12 @@ class QueryMetricProvider(MetricProvider):
         query_parameters: Optional[QueryParameters] = None,
     ) -> str:
         parameters = cls._get_parameters_dict_from_query_parameters(query_parameters)
-        # Determine alias connector. Oracle does not allow the keyword 'AS' for
-        # table/subquery aliases, whereas other dialects commonly allow it.
-        alias_connector = " AS "
-        try:
-            sa_engine = getattr(execution_engine, "engine", None)
-            sa_dialect_name = sa_engine.dialect.name if sa_engine is not None else None
-        except Exception:
-            sa_dialect_name = None
 
-        # Coerce the SQLAlchemy dialect name to the GXSqlDialect enum when
-        # possible and use enum comparisons for dialect-specific behavior.
-        gx_dialect: GXSqlDialect | None
-        try:
-            gx_dialect = GXSqlDialect(sa_dialect_name) if sa_dialect_name else None
-        except Exception:
-            gx_dialect = None
-
-        # Oracle uses a space instead of 'AS' for table/subquery aliases.
-        if gx_dialect == GXSqlDialect.ORACLE:
-            alias_connector = " "
-
-        # Determine whether the current dialect requires derived-table aliases
-        # (MySQL/MariaDB and PostgreSQL require an explicit alias for derived tables).
-        dialect_requires_derived_table_alias = False
-        if gx_dialect in (GXSqlDialect.MYSQL, GXSqlDialect.POSTGRESQL):
-            dialect_requires_derived_table_alias = True
-        # MariaDB is sometimes reported as 'mariadb' by certain SQLAlchemy dialects;
-        # handle that string as a fallback.
-        elif isinstance(sa_dialect_name, str) and sa_dialect_name.lower() == "mariadb":
-            dialect_requires_derived_table_alias = True
+        # Pull dialect-specific aliasing behavior into a helper to reduce
+        # complexity and branch count in this method (improves linting).
+        alias_connector, dialect_requires_derived_table_alias = (
+            cls._get_aliasing_behavior_for_engine(execution_engine)
+        )
 
         if isinstance(batch_selectable, sa.Table):
             # Table objects can be formatted directly (no extra aliasing needed).
@@ -192,3 +168,37 @@ class QueryMetricProvider(MetricProvider):
             return [element._asdict() for element in result]
         else:
             return [result]
+
+    @classmethod
+    def _get_aliasing_behavior_for_engine(
+        cls, execution_engine: SqlAlchemyExecutionEngine
+    ) -> tuple[str, bool]:
+        """Return (alias_connector, dialect_requires_derived_table_alias).
+
+        Using a helper reduces complexity in the main substitution method and
+        consolidates dialect mapping logic in one place.
+        """
+        alias_connector = " AS "
+        try:
+            sa_engine = getattr(execution_engine, "engine", None)
+            sa_dialect_name = sa_engine.dialect.name if sa_engine is not None else None
+        except Exception:
+            sa_dialect_name = None
+
+        # Try to coerce to GXSqlDialect enum; fall back to string checks.
+        gx_dialect: GXSqlDialect | None
+        try:
+            gx_dialect = GXSqlDialect(sa_dialect_name) if sa_dialect_name else None
+        except Exception:
+            gx_dialect = None
+
+        if gx_dialect == GXSqlDialect.ORACLE:
+            alias_connector = " "
+
+        dialect_requires_derived_table_alias = False
+        if gx_dialect in (GXSqlDialect.MYSQL, GXSqlDialect.POSTGRESQL) or (
+            isinstance(sa_dialect_name, str) and sa_dialect_name.lower() == "mariadb"
+        ):
+            dialect_requires_derived_table_alias = True
+
+        return alias_connector, dialect_requires_derived_table_alias
