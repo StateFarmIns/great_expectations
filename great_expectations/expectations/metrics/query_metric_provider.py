@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence, Union, cast
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -108,69 +108,93 @@ class QueryMetricProvider(MetricProvider):
         query_parameters: Optional[QueryParameters] = None,
     ) -> str:
         parameters = cls._get_parameters_dict_from_query_parameters(query_parameters)
+        user_provided_alias = cls._detect_user_provided_alias(query)
 
-        # Pull dialect-specific aliasing behavior into a helper to reduce
-        # complexity and branch count in this method (improves linting).
+        if isinstance(batch_selectable, sa.Table):
+            # Table objects can be formatted directly (no extra aliasing needed).
+            return query.format(batch=batch_selectable, **parameters)
+
+        if isinstance(batch_selectable, (sa.sql.Select, get_sqlalchemy_subquery_type())):
+            batch_fragment = cls._format_batch_selectable_for_query(
+                batch_selectable=batch_selectable,
+                query=query,
+                execution_engine=execution_engine,
+                user_provided_alias=user_provided_alias,
+            )
+            return query.format(batch=batch_fragment, **parameters)
+
+        return query.format(batch=f"({batch_selectable})", **parameters)
+
+    @classmethod
+    def _detect_user_provided_alias(cls, query: str) -> bool:
+        """Detect whether the user provided an alias after `{batch}`.
+
+        Returns True only when a valid identifier follows `{batch}` (optionally
+        preceded by `AS`) and that identifier is not a common SQL keyword.
+        """
+        alias_match = re.search(
+            r"\{batch\}\s*(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)\b",
+            query,
+            flags=re.IGNORECASE,
+        )
+        if not alias_match:
+            return False
+        candidate = alias_match.group(1)
+        sql_keywords = {
+            "WHERE",
+            "JOIN",
+            "ON",
+            "USING",
+            "GROUP",
+            "ORDER",
+            "LIMIT",
+            "HAVING",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
+        }
+        return candidate.upper() not in sql_keywords
+
+    @classmethod
+    def _format_batch_selectable_for_query(
+        cls,
+        batch_selectable: sa.Selectable,
+        query: str,
+        execution_engine: SqlAlchemyExecutionEngine,
+        user_provided_alias: bool,
+    ) -> str:
+        """Compile and format a Select/Subquery for insertion into the query.
+
+        This centralizes the compile/aliasing rules so the main method stays
+        small and easier to lint.
+        """
         alias_connector, dialect_requires_derived_table_alias = (
             cls._get_aliasing_behavior_for_engine(execution_engine)
         )
 
-        # Detect whether the user already provided an alias after `{batch}`
-        # in the query (e.g. `FROM {batch} t1` or `FROM {batch} AS t1`). If the
-        # caller provides an alias, we must NOT append our own derived-table
-        # alias (that would produce `AS substituted_batch_subquery t1` and
-        # break MySQL syntax).
-        user_provided_alias = bool(
-            re.search(r"\{batch\}\s*(?:AS\s+)?[A-Za-z_]", query, flags=re.IGNORECASE)
-        )
+        # If the query contains a JOIN, callers are expected to provide their
+        # own aliasing; compile the raw selectable and append our alias only
+        # when the dialect requires it and the user did not provide one.
+        if "JOIN" in query.upper():
+            compiled = cast("Any", batch_selectable).compile(compile_kwargs={"literal_binds": True})
+            if dialect_requires_derived_table_alias and not user_provided_alias:
+                return f"({compiled}){alias_connector}substituted_batch_subquery"
+            return f"({compiled})"
 
-        if isinstance(batch_selectable, sa.Table):
-            # Table objects can be formatted directly (no extra aliasing needed).
-            query = query.format(batch=batch_selectable, **parameters)
-        elif isinstance(batch_selectable, (sa.sql.Select, get_sqlalchemy_subquery_type())):
-            # specifying a row_condition returns the active batch as a Select
-            # specifying an unexpected_rows_query returns the active batch as a Subquery or Alias
-            # this requires compilation & aliasing when formatting the parameterized query
+        # If the caller already supplied an alias token after `{batch}`, compile
+        # the raw selectable and preserve the user's alias usage.
+        if user_provided_alias:
+            compiled = cast("Any", batch_selectable).compile(compile_kwargs={"literal_binds": True})
+            return f"({compiled})"
 
-            # all join queries require the user to have taken care of aliasing themselves
-            if "JOIN" in query.upper():
-                # Use the raw selectable for compilation when the caller will
-                # supply an alias; otherwise compiled selectable can be
-                # aliased as needed.
-                batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
-                if dialect_requires_derived_table_alias and not user_provided_alias:
-                    query = query.format(
-                        batch=f"({batch}){alias_connector}substituted_batch_subquery",
-                        **parameters,
-                    )
-                else:
-                    query = query.format(batch=f"({batch})", **parameters)
-            # If the caller already provides an alias (e.g. `FROM {batch} t1`),
-            # compile the raw selectable and do not append our derived-table
-            # alias; otherwise, compile an aliased selectable and append
-            # the dialect-appropriate alias when required.
-            elif user_provided_alias:
-                batch = batch_selectable.compile(compile_kwargs={"literal_binds": True})
-                query = query.format(batch=f"({batch})", **parameters)
-            else:
-                aliased_batch = batch_selectable.alias("subselect")
-                batch = aliased_batch.compile(compile_kwargs={"literal_binds": True})
-                if dialect_requires_derived_table_alias:
-                    query = query.format(
-                        batch=f"({batch!s}){alias_connector}substituted_batch_subquery",
-                        **parameters,
-                    )
-                else:
-                    # Preserve previous behavior for non-MySQL-like dialects
-                    query = query.format(batch=f"({batch!s})", **parameters)
-        else:
-            # Fallback: format the batch_selectable as a parenthesized fragment.
-            # Historically this did not add an explicit alias; keep that behavior
-            # to match existing unit tests and avoid changing simple table
-            # formatting expectations.
-            query = query.format(batch=f"({batch_selectable})", **parameters)
-
-        return query
+        # Default: compile an aliased selectable. Append derived-table alias
+        # only for dialects that require it; otherwise, embed compiled SQL
+        # without adding an substituted alias to preserve historical behavior.
+        aliased_batch = cast("Any", batch_selectable).alias("subselect")
+        compiled = cast("Any", aliased_batch).compile(compile_kwargs={"literal_binds": True})
+        if dialect_requires_derived_table_alias and not user_provided_alias:
+            return f"({compiled!s}){alias_connector}substituted_batch_subquery"
+        return f"({compiled!s})"
 
     @classmethod
     def _get_sqlalchemy_records_from_substituted_batch_subquery(
@@ -203,20 +227,26 @@ class QueryMetricProvider(MetricProvider):
         except Exception:
             sa_dialect_name = None
 
-        # Try to coerce to GXSqlDialect enum; fall back to string checks.
+        # Normalize dialect name (strip driver suffix like '+pymysql') and
+        # try to coerce to GXSqlDialect enum; fall back to string checks.
+        dialect_name_base = None
+        if isinstance(sa_dialect_name, str):
+            dialect_name_base = sa_dialect_name.split("+", 1)[0]
+
         gx_dialect: GXSqlDialect | None
         try:
-            gx_dialect = GXSqlDialect(sa_dialect_name) if sa_dialect_name else None
+            gx_dialect = GXSqlDialect(dialect_name_base) if dialect_name_base else None
         except Exception:
             gx_dialect = None
 
-        if gx_dialect == GXSqlDialect.ORACLE:
+        if gx_dialect is GXSqlDialect.ORACLE:
             alias_connector = " "
 
         dialect_requires_derived_table_alias = False
-        if gx_dialect in (GXSqlDialect.MYSQL, GXSqlDialect.POSTGRESQL) or (
-            isinstance(sa_dialect_name, str) and sa_dialect_name.lower() == "mariadb"
-        ):
+        if (
+            isinstance(gx_dialect, GXSqlDialect)
+            and gx_dialect in (GXSqlDialect.MYSQL, GXSqlDialect.POSTGRESQL)
+        ) or (isinstance(dialect_name_base, str) and dialect_name_base.lower() == "mariadb"):
             dialect_requires_derived_table_alias = True
 
         return alias_connector, dialect_requires_derived_table_alias
